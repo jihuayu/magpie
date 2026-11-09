@@ -291,3 +291,31 @@ func TestWindowPageActions(t *testing.T) {
 		t.Errorf("%d actions: %+v, want %d", len(names), w, maxPageActions)
 	}
 }
+
+// A page's confirmations (magpie.page.confirm) are only methods its page
+// may call: one that isn't in magpie.page.actions is no confirmation, and
+// a page-only plugin has neither.
+func TestWindowPageConfirm(t *testing.T) {
+	root := t.TempDir()
+	mk := func(name, pkg string) string {
+		t.Helper()
+		d := filepath.Join(root, name)
+		if err := os.MkdirAll(filepath.Join(d, "page"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(d, "page", "index.html"), []byte("<p>hi</p>"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(d, "package.json"), []byte(pkg), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		return d
+	}
+	base := `{"name":"p","main":"index.js","magpie":{"page":{"file":"page/index.html","actions":["status","run"],"confirm":`
+	if w, _ := Window(mk("ok", base+`["run","stop","Bad Name"]}}}`)); w == nil || !slices.Equal(w.Page.Confirm, []string{"run"}) {
+		t.Errorf("confirm: %+v", w)
+	}
+	if w, _ := Window(mk("only", `{"name":"p","magpie":{"page":{"file":"page/index.html","actions":["run"],"confirm":["run"]}}}`)); w == nil || len(w.Page.Confirm) != 0 || len(w.Page.Actions) != 0 {
+		t.Errorf("a page-only plugin's confirmations: %+v", w)
+	}
+}

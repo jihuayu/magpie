@@ -13,6 +13,11 @@
 //   await magpie.invoke(m, p)     a method its package.json's
 //                                 magpie.page.actions names, run by its
 //                                 own plugin's hooks ({page: {actions}})
+//   await magpie.portReady        the page's MessagePort, once the window
+//                                 has given it one (magpie.onEvent and
+//                                 magpie.onCall wait for it themselves)
+//   magpie.onEvent((name, data))  events the plugin emits (ctx.emit)
+//   magpie.onCall(async (m, a))   calls the plugin makes (ctx.callPage)
 //   magpie.context                where a panel is (P5): { provider: {
 //                                 id, name } } in a provider's editor,
 //                                 else {}; set once magpie.ready is
@@ -55,6 +60,45 @@
   const watched = [];
   let acting = null;
   const acted = [];
+  // the page's own port from the window: events its plugin emits, and
+  // calls the plugin makes into the page. One per frame, opened on hello.
+  let port = null;
+  let portReady;
+  const ready = new Promise((resolve) => { portReady = resolve; });
+  const eventFns = [];
+  const eventQ = [];
+  let callFn = null;
+  const callQ = [];
+  function onEvent(fn) {
+    if (typeof fn !== "function") return;
+    eventFns.push(fn);
+    for (const d of eventQ.splice(0)) { try { fn(d.name, d.data); } catch (err) { report(err); } }
+  }
+  function onCall(fn) {
+    if (typeof fn !== "function") return;
+    callFn = fn;
+    for (const d of callQ.splice(0)) runCall(d);
+  }
+  function heard(d) {
+    if (!d || !port) return;
+    if (d.event === "event") {
+      if (!eventFns.length) { if (eventQ.length < 100) eventQ.push(d); return; }
+      for (const fn of eventFns) { try { fn(d.name, d.data); } catch (err) { report(err); } }
+      return;
+    }
+    if (d.event === "call") {
+      if (!callFn) { if (callQ.length < 100) callQ.push(d); return; }
+      runCall(d);
+    }
+  }
+  async function runCall(d) {
+    try {
+      const result = await callFn(d.method, d.args);
+      port?.postMessage({ type: "reply", id: d.id, ok: true, result: result === undefined ? null : result });
+    } catch (err) {
+      port?.postMessage({ type: "reply", id: d.id, ok: false, error: String(err?.message || err) });
+    }
+  }
   function call(method, params) {
     const id = ++next;
     return new Promise((resolve, reject) => {
@@ -87,6 +131,13 @@
     }
     if (m.event === "action") {
       if (acting) act(m.data); else acted.push(m.data);
+      return;
+    }
+    if (m.event === "port" && e.ports?.[0]) {
+      port = e.ports[0];
+      port.onmessage = (ev) => heard(ev.data);
+      port.start?.();
+      portReady(port);
       return;
     }
     const w = waiting.get(m.id);
@@ -135,7 +186,17 @@
     // package.json's magpie.page.actions. Only this page's methods reach
     // its own plugin: the window binds the call to the frame, and the
     // host looks the method up among that plugin's hooks alone.
-    invoke: (method, params) => call("invoke", { method: String(method ?? ""), args: params ?? {} }),
+    invoke: (method, params, opts) => call("invoke", { method: String(method ?? ""), args: params ?? {}, background: !!opts?.background }),
+    // the page's port: events its plugin emits (onEvent), and calls its
+    // plugin makes into the page (onCall). Both wait for the port, so a
+    // handler registered right after magpie.ready misses nothing.
+    portReady: ready,
+    onEvent,
+    onCall,
+    // a long method runs on: magpie.invoke(m, p, {background: true})
+    // answers {jobId}, and job/cancelJob ask about it
+    job: (id) => call("job", { id: String(id ?? "") }),
+    cancelJob: (id) => call("cancelJob", { id: String(id ?? "") }),
   };
   api.ready = call("hello").then(({ context, service, visible, ...theme }) => {
     api.theme = theme;

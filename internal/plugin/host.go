@@ -63,14 +63,65 @@ type message struct {
 	Level    string `json:"level"`
 	Message  string `json:"message"`
 	Title    string `json:"title"`
+	Name     string `json:"name"`
 	Variant  string `json:"variant"`
 	Count    int    `json:"count"`
+	// a "page" event: a page's stream (kind "event"), a call the plugin
+	// makes into its page (kind "call") or the page's answer to one
+	Spec      string          `json:"spec"`
+	Kind      string          `json:"kind"`
+	CallID    string          `json:"callId"`
+	Method    string          `json:"method"`
+	PageArgs  json.RawMessage `json:"pageArgs"`
+	PageData  json.RawMessage `json:"pageData"`
+	PageReply json.RawMessage `json:"pageReply"`
+	OK        bool            `json:"ok"`
 	// Loads is a "load" event's models and how busy each is, a percent;
 	// -1 clears one (magpie.load in host.js)
 	Loads map[string]float64 `json:"loads"`
 	// Usage is a "usage" event's request, one the plugin sent its vendor
 	// on its own (magpie.usage in host.js)
 	Usage *OwnCall `json:"usage"`
+}
+
+// PageEvent is a plugin's page stream: an event it emits to its page, a
+// call it makes into its page, or the page's answer to one. The GUI
+// forwards it to the page's window, which alone holds the frame.
+type PageEvent struct {
+	Spec   string
+	Kind   string // "event", "call" or "reply"
+	Name   string
+	CallID string
+	Method string
+	Args   json.RawMessage
+	Data   json.RawMessage
+	Result json.RawMessage
+	OK     bool
+	Error  string
+}
+
+var pageEventHook struct {
+	sync.Mutex
+	f func(PageEvent)
+}
+
+// OnPageEvent sets what receives a plugin's page events, or clears it with
+// nil. The GUI sets it once; a host has one.
+func OnPageEvent(f func(PageEvent)) {
+	pageEventHook.Lock()
+	pageEventHook.f = f
+	pageEventHook.Unlock()
+}
+
+func pageEvent(m message) {
+	pageEventHook.Lock()
+	f := pageEventHook.f
+	pageEventHook.Unlock()
+	if f == nil {
+		return
+	}
+	f(PageEvent{Spec: m.Spec, Kind: m.Kind, Name: m.Name, CallID: m.CallID, Method: m.Method,
+		Args: m.PageArgs, Data: m.PageData, Result: m.PageReply, OK: m.OK, Error: m.Message})
 }
 
 // OwnCall is a request a plugin sent its vendor on its own, outside any
@@ -1430,6 +1481,8 @@ func (h *host) dispatch(m message) {
 		case "heavy":
 			log.Printf("plugin: the host holds %d MiB after a collection; a new one takes the next calls", m.Count)
 			go h.recycle()
+		case "page":
+			pageEvent(m)
 		}
 		return
 	}

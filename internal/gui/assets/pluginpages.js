@@ -42,7 +42,39 @@
     return { dark, lang: locale, tokens };
   }
 
-  function post(win, msg) { win?.postMessage({ magpie: 1, ...msg }, "*"); }
+  function post(win, msg, transfer) { win?.postMessage({ magpie: 1, ...msg }, "*", transfer || []); }
+
+  // a page's frame is gone: its MessagePort and event stream go with it.
+  // The page's own EventSource reconnects when it is made again.
+  function closePage(p) {
+    try { p.port?.close(); } catch { /* already gone */ }
+    p.port = null;
+    p.events?.close();
+    p.events = null;
+  }
+
+  // what the page answered to one of its plugin's calls goes back to the
+  // host waiting on it, by the page's own spec
+  function pageSaid(p, d) {
+    if (!d || d.type !== "reply" || !d.id) return;
+    api("plugin-pages/reply", { spec: p.entry.spec, callId: String(d.id), ok: !!d.ok, result: d.result ?? null, error: String(d.error || "") }).catch(() => {});
+  }
+
+  // the plugin's events and calls for this page: over the window's
+  // EventSource, then the page's MessagePort (no postMessage storm)
+  function watchPage(p) {
+    if (p.events) return;
+    try {
+      p.events = new EventSource("/api/plugin-pages/events?spec=" + encodeURIComponent(p.entry.spec));
+    } catch { return; }
+    p.events.onmessage = (ev) => {
+      let m;
+      try { m = JSON.parse(ev.data); } catch { return; }
+      if (!p.port) return;
+      if (m.kind === "event") p.port.postMessage({ event: "event", name: m.name, data: m.data });
+      else if (m.kind === "call") p.port.postMessage({ event: "call", id: m.callId, method: m.method, args: m.args });
+    };
+  }
 
   // the theme or the language changed: every page open is told
   function pushTheme() {
@@ -78,6 +110,7 @@
     if (!p) return undefined;
     clearTimeout(p.idle);
     if (p.frame?.isConnected) { seen(p, true); return p.ready; }
+    closePage(p);
     const main = $("#view-" + key);
     const f = document.createElement("iframe");
     f.className = "plugin-frame";
@@ -97,6 +130,7 @@
       p.timer = setTimeout(() => { if (!p.hello) reject(new Error(t("{name}'s page didn't answer", { name: titled(p.entry) }))); }, HELLO_MS);
     });
     main.replaceChildren(f);
+    watchPage(p);
     return p.ready;
   }
 
@@ -115,20 +149,31 @@
       p.frame.remove();
       p.frame = null;
       p.hello = false;
+      closePage(p);
     }, IDLE_MS);
   }
 
   async function answer(p, m) {
     const e = p.entry;
     switch (m.method) {
-      case "hello":
+      case "hello": {
         p.hello = true;
         clearTimeout(p.timer);
         p.said?.();
+        // the page gets a port of its own for events and calls: one
+        // channel per frame, never a reply over the window's postMessage
+        try { p.port?.close(); } catch { /* already gone */ }
+        const ch = new MessageChannel();
+        p.port = ch.port1;
+        p.port.onmessage = (ev) => pageSaid(p, ev.data);
+        p.port.start?.();
+        p.frame?.contentWindow?.postMessage({ magpie: 1, event: "port" }, "*", [ch.port2]);
+        watchPage(p);
         // a panel is told where it is: the provider whose editor it is in;
         // a page served to a browser, where its local service is through
         // this server (pageservice.go), relative to the page
         return { ...theme(), context: p.context || {}, service: (!p.context && e.service) || "", visible: p.shown ?? true };
+      }
       case "theme":
         return theme();
       case "options.get":
@@ -140,10 +185,30 @@
       }
       case "invoke": {
         const method = String(m.params?.method || "");
+        const args = m.params?.args || {};
         // what its package didn't declare is refused here, and again by
         // the server, and the host keeps the methods of its own plugin
         if (!Array.isArray(e.methods) || !e.methods.includes(method)) throw new Error(t("No such call: {what}", { what: method }));
-        return api("plugin-pages/invoke", { spec: e.spec, method, args: m.params?.args || {} });
+        // a method its package put in magpie.page.confirm is asked about
+        // here, in the window: the page can't answer for the reader, and
+        // the grant the server takes is bound to this call
+        let confirmId = "";
+        if (Array.isArray(e.confirm) && e.confirm.includes(method)) {
+          if (!confirm(t("{name} asks to run {what}. Continue?", { name: titled(e), what: method }))) return { cancelled: true };
+          const c = await api("plugin-pages/confirm", { spec: e.spec, method, args });
+          confirmId = c?.confirmId || "";
+        }
+        return api("plugin-pages/invoke", { spec: e.spec, method, args, confirmId, background: !!m.params?.background });
+      }
+      case "job": {
+        const id = String(m.params?.id || "");
+        if (!id) throw new Error(t("No such call: {what}", { what: "job" }));
+        return api("plugin-pages/jobs/" + encodeURIComponent(id));
+      }
+      case "cancelJob": {
+        const id = String(m.params?.id || "");
+        if (!id) throw new Error(t("No such call: {what}", { what: "cancelJob" }));
+        return api("plugin-pages/jobs/" + encodeURIComponent(id) + "/cancel", {});
       }
       case "read": {
         const name = String(m.params?.name || "");
@@ -233,6 +298,7 @@
       p.frame?.remove();
       p.frame = null;
       p.gone = true;
+      closePage(p);
       if (view === k) show("plugins");
     }
     let head = nav.querySelector(".nav-gl[data-plugin-pages]");
@@ -255,6 +321,7 @@
       } else if (p.entry.url !== e.url || p.gone) {
         p.frame?.remove();
         p.frame = null;
+        closePage(p);
       }
       p.gone = false;
       p.entry = e;

@@ -1903,6 +1903,45 @@ function pageActionsOf(spec) {
   return m
 }
 
+// pageCalls are the calls a plugin made into its page and is waiting on,
+// by spec and call id. A page that went away leaves its call to time out.
+const pageCalls = new Map()
+let pageCallSeq = 0
+const pageCallKey = (spec, id) => spec + "\x00" + id
+
+// pageEmit sends an event to the plugin's own page, through Go and the
+// window: {event, data}. One nobody is looking at is dropped.
+function pageEmit(spec, name, data) {
+  send({ event: "page", spec, kind: "event", name: String(name), pageData: data === undefined ? null : data })
+}
+
+// pageCall asks the plugin's own page method and waits for its answer.
+function pageCall(spec, method, args, ms) {
+  const id = "p" + ++pageCallSeq
+  const key = pageCallKey(spec, id)
+  const wait = ms > 0 ? ms : 60_000
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => {
+      pageCalls.delete(key)
+      reject(new Error(`${method} took longer than ${took(wait)}`))
+    }, wait)
+    pageCalls.set(key, { resolve, reject, timer })
+    send({ event: "page", spec, kind: "call", callId: id, method: String(method), pageArgs: args ?? {} })
+  })
+}
+
+// pageReply is the page's answer to one: its result, or why it refused.
+function pageReply({ spec, id, ok, pageReply: result, message }) {
+  const key = pageCallKey(spec, String(id || ""))
+  const c = pageCalls.get(key)
+  if (!c) return null
+  pageCalls.delete(key)
+  clearTimeout(c.timer)
+  if (ok) c.resolve(result === undefined ? null : result)
+  else c.reject(new Error(String(message || "the page refused")))
+  return null
+}
+
 async function runPageAction({ spec, method, args, ms }) {
   const name = String(method ?? "")
   const fn = pageActionsOf(spec).get(name)
@@ -1916,6 +1955,8 @@ async function runPageAction({ spec, method, args, ms }) {
     worktree: directory,
     abort,
     metadata() {},
+    emit: (event, data) => pageEmit(spec, event, data),
+    callPage: (pageMethod, pageArgs, pageMs) => pageCall(spec, pageMethod, pageArgs, pageMs),
   }
   const out = await Promise.race([
     Promise.resolve().then(() => fn(args, ctx)),
@@ -3360,6 +3401,7 @@ const handlers = {
   callback,
   tool: runTool,
   pageInvoke: runPageAction,
+  pageReply,
   search: runSearch,
   apiKey,
   load,

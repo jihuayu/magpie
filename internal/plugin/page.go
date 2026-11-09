@@ -56,6 +56,10 @@ type PageSpec struct {
 	// this page. The plugin's hooks declare each one; a name here that no
 	// hook declares is refused.
 	Actions []string
+	// Confirm are the methods among Actions the window asks the reader
+	// about before calling (magpie.page.confirm): a one-time confirmation
+	// the page cannot give itself.
+	Confirm []string
 }
 
 // ServiceSpec is a page's local service: an HTTP server on 127.0.0.1 at
@@ -209,6 +213,7 @@ func Window(target string) (w *WindowSpec, only bool) {
 		Service   json.RawMessage `json:"service"`
 		KeepAlive json.RawMessage `json:"keepAlive"`
 		Actions   json.RawMessage `json:"actions"`
+		Confirm   json.RawMessage `json:"confirm"`
 	}
 	var pkg struct {
 		Main    string          `json:"main"`
@@ -227,6 +232,8 @@ func Window(target string) (w *WindowSpec, only bool) {
 	if pg := pkg.Magpie.Page; pg != nil {
 		if file, ok := htmlInside(target, pg.File); ok {
 			p := &PageSpec{Title: strings.TrimSpace(pg.Title), Titles: titles(pg.Titles), File: file, Dir: filepath.Dir(file), KeepAlive: string(pg.KeepAlive) == "true", Actions: pageActions(pg.Actions)}
+			// only a method the page may call can be one it confirms
+			p.Confirm = slices.DeleteFunc(pageActions(pg.Confirm), func(name string) bool { return !slices.Contains(p.Actions, name) })
 			// the icon is served with the page, so it sits in the page's folder
 			if icon, ok := inside(target, pg.Icon); ok {
 				if rel, err := filepath.Rel(p.Dir, icon); err == nil && rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
@@ -244,7 +251,7 @@ func Window(target string) (w *WindowSpec, only bool) {
 			} else {
 				// a page with no host part has nothing to answer its
 				// methods, so they are not offered
-				p.Actions = nil
+				p.Actions, p.Confirm = nil, nil
 			}
 			w.Page = p
 		}

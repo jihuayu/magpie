@@ -283,8 +283,22 @@ only a name the page listed, with `POST /api/plugin-pages/invoke`; Go checks
 the page's `methods` again and calls the host's `pageInvoke`, which looks the
 name up among that spec's `{page: {actions}}` hooks alone and runs it within
 60s. Nothing of another plugin's is reachable. A page with no
-`magpie.page.actions` has no methods. Tests: `TestWindowPageActions`,
-`TestPluginPageInvokeOnlyDeclared`.
+`magpie.page.actions` has no methods. `magpie.invoke(m, p, {background: true})`
+answers `{jobId}` at once, and `magpie.job(id)` / `magpie.cancelJob(id)` ask
+about it; the job lives in the GUI process, with a 30-minute cap, and a
+restart loses it. `magpie.page.confirm` names methods the window asks the
+reader about: the window gets a one-time `confirmId` from
+`POST /api/plugin-pages/confirm` bound to the page, method and arguments, and
+`invoke` refuses a confirmed method without it, so a page cannot answer for
+the reader. The page's `MessagePort` (the window's hello answer transfers it)
+carries `magpie.onEvent(name, data)` from `ctx.emit` and `magpie.onCall(fn)`
+from `ctx.callPage`; an answer comes back over `POST /api/plugin-pages/reply`,
+by the page's spec. Events reach the window over
+`GET /api/plugin-pages/events?spec=…` (SSE), and the window forwards them to
+the frame's port; the page itself still has no way to `/api` or the network.
+Tests: `TestWindowPageActions`, `TestWindowPageConfirm`,
+`TestPluginPageInvokeOnlyDeclared`, `TestPluginPageConfirmAndReply`,
+`TestPluginPageBackgroundJob`.
 
 `plugins/middleware` is now "JS gateway plugins". Apply registers the chain and `usage.Observe(middleware.Points())`; off, no JS middleware, strategy or `onUsage` runs, and a pool routed by a JS strategy is its listed order. `InUse` is unchanged. ([`middleware.go`](../../plugins/middleware/middleware.go))
 

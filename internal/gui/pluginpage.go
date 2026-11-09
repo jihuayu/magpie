@@ -82,6 +82,9 @@ type pluginPage struct {
 	// Methods are the methods the page may call of its plugin
 	// (magpie.page.actions): only these reach /api/plugin-pages/invoke
 	Methods []string `json:"methods,omitempty"`
+	// Confirm are the methods the window asks the reader about first
+	// (magpie.page.confirm); the window takes a one-time confirmId
+	Confirm []string `json:"confirm,omitempty"`
 	// Actions are its items in magpie's menus (plugin.ActionSpec); each
 	// opens this page
 	Actions []pluginAction `json:"actions,omitempty"`
@@ -161,7 +164,7 @@ func windowParts() (pages []pluginPage, panels []pluginPanel) {
 		if spec := w.Page; spec != nil {
 			tok := pageToken(e.Spec)
 			rel, _ := filepath.Rel(spec.Dir, spec.File)
-			p := pluginPage{Spec: e.Spec, Name: name, Key: key, Title: spec.Title, Titles: spec.Titles, Reads: reads, Methods: spec.Actions, token: tok, dir: spec.Dir,
+			p := pluginPage{Spec: e.Spec, Name: name, Key: key, Title: spec.Title, Titles: spec.Titles, Reads: reads, Methods: spec.Actions, Confirm: spec.Confirm, token: tok, dir: spec.Dir,
 				URL: pluginPagePrefix + tok + "/" + filepath.ToSlash(rel), file: filepath.ToSlash(rel), hosted: !only, options: e.Options, KeepAlive: spec.KeepAlive}
 			if !only {
 				p.service = spec.Service
@@ -414,11 +417,241 @@ func apiFramed(r *http.Request) bool {
 // plugin.Call, replaced in tests that run no host.
 var callPageInvoke = plugin.Call
 
+// pageConfirmation is a one-time grant the window got after asking the
+// reader about a method in magpie.page.confirm. It names the page, the
+// method and the arguments it was granted for, and expires.
+type pageConfirmation struct {
+	spec, method, hash string
+	expires            time.Time
+}
+
+var pageConfirmations = struct {
+	sync.Mutex
+	m map[string]pageConfirmation
+}{m: map[string]pageConfirmation{}}
+
+// confirmHash is what a confirmation is bound to: the page, the method and
+// the arguments exactly as the window sent them.
+func confirmHash(spec, method string, args []byte) string {
+	h := sha256.New()
+	h.Write([]byte(spec))
+	h.Write([]byte{0})
+	h.Write([]byte(method))
+	h.Write([]byte{0})
+	h.Write(args)
+	return hex.EncodeToString(h.Sum(nil))
+}
+
+// issuePageConfirm grants one call of spec's method with args: a random
+// id, good for a minute and once.
+func issuePageConfirm(spec, method string, args []byte) (string, bool) {
+	now := time.Now()
+	pageConfirmations.Lock()
+	defer pageConfirmations.Unlock()
+	for id, c := range pageConfirmations.m {
+		if now.After(c.expires) {
+			delete(pageConfirmations.m, id)
+		}
+	}
+	if len(pageConfirmations.m) >= 512 {
+		return "", false
+	}
+	b := make([]byte, 16)
+	if _, err := rand.Read(b); err != nil {
+		return "", false
+	}
+	id := hex.EncodeToString(b)
+	pageConfirmations.m[id] = pageConfirmation{spec: spec, method: method, hash: confirmHash(spec, method, args), expires: now.Add(time.Minute)}
+	return id, true
+}
+
+// takePageConfirm uses up the grant id for spec's method with args, if it
+// is that one and not expired.
+func takePageConfirm(id, spec, method string, args []byte) bool {
+	pageConfirmations.Lock()
+	defer pageConfirmations.Unlock()
+	c, ok := pageConfirmations.m[id]
+	if !ok {
+		return false
+	}
+	delete(pageConfirmations.m, id)
+	return !time.Now().After(c.expires) && c.spec == spec && c.method == method && c.hash == confirmHash(spec, method, args)
+}
+
+// A page method may run on past its request: the window asks for a job,
+// gets an id and asks for its state, and may cancel it. The job lives in
+// this process only; magpie restarted loses the list, not the plugin's
+// own state.
+type pageJob struct {
+	id, spec, method string
+	state            string
+	result           json.RawMessage
+	err              string
+	started, ended   time.Time
+	cancel           context.CancelFunc
+}
+
+var pageJobs = struct {
+	sync.Mutex
+	m map[string]*pageJob
+}{m: map[string]*pageJob{}}
+
+// startPageJob runs one of a page's methods in the background, within
+// half an hour, and answers its id.
+func startPageJob(spec, method string, args json.RawMessage) (string, bool) {
+	now := time.Now()
+	pageJobs.Lock()
+	for id, j := range pageJobs.m {
+		if !j.ended.IsZero() && now.Sub(j.ended) > time.Hour {
+			delete(pageJobs.m, id)
+		}
+	}
+	if len(pageJobs.m) >= 100 {
+		pageJobs.Unlock()
+		return "", false
+	}
+	b := make([]byte, 12)
+	if _, err := rand.Read(b); err != nil {
+		pageJobs.Unlock()
+		return "", false
+	}
+	id := "job-" + hex.EncodeToString(b)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Minute)
+	j := &pageJob{id: id, spec: spec, method: method, state: "running", started: now, cancel: cancel}
+	pageJobs.m[id] = j
+	pageJobs.Unlock()
+	go func() {
+		var out json.RawMessage
+		err := callPageInvoke(ctx, "pageInvoke", map[string]any{"spec": spec, "method": method, "args": args, "ms": 30 * 60 * 1000}, &out)
+		pageJobs.Lock()
+		defer pageJobs.Unlock()
+		j.ended = time.Now()
+		j.cancel = nil
+		if ctx.Err() == context.Canceled {
+			j.state = "canceled"
+			return
+		}
+		if err != nil {
+			j.state = "failed"
+			j.err = err.Error()
+			return
+		}
+		j.state = "done"
+		if len(out) == 0 {
+			out = json.RawMessage("null")
+		}
+		j.result = out
+	}()
+	return id, true
+}
+
+// pageJobState is one job as the window sees it.
+func pageJobState(id string) (map[string]any, bool) {
+	pageJobs.Lock()
+	defer pageJobs.Unlock()
+	j, ok := pageJobs.m[id]
+	if !ok {
+		return nil, false
+	}
+	out := map[string]any{"id": j.id, "spec": j.spec, "method": j.method, "state": j.state,
+		"started": j.started, "result": j.result, "error": j.err}
+	if !j.ended.IsZero() {
+		out["ended"] = j.ended
+	}
+	return out, true
+}
+
+func cancelPageJob(id string) bool {
+	pageJobs.Lock()
+	defer pageJobs.Unlock()
+	j, ok := pageJobs.m[id]
+	if !ok || j.cancel == nil {
+		return false
+	}
+	j.cancel()
+	j.cancel = nil
+	return true
+}
+
+// pageEventJSON is one event of a page's stream, as the window's
+// EventSource gets it.
+type pageEventJSON struct {
+	Kind   string          `json:"kind"`
+	Name   string          `json:"name,omitempty"`
+	CallID string          `json:"callId,omitempty"`
+	Method string          `json:"method,omitempty"`
+	Args   json.RawMessage `json:"args,omitempty"`
+	Data   json.RawMessage `json:"data,omitempty"`
+	Result json.RawMessage `json:"result,omitempty"`
+	OK     bool            `json:"ok,omitempty"`
+	Error  string          `json:"error,omitempty"`
+}
+
+// pageEventHub fans a plugin's page stream out to the window looking at
+// that page. A stream nobody reads drops its events; the page's frame
+// gets them one at a time through a MessagePort.
+type pageEventHub struct {
+	mu   sync.Mutex
+	subs map[string]map[chan []byte]struct{}
+}
+
+var pageEvents = pageEventHub{subs: map[string]map[chan []byte]struct{}{}}
+
+func (h *pageEventHub) subscribe(spec string) (<-chan []byte, func()) {
+	ch := make(chan []byte, 64)
+	h.mu.Lock()
+	if h.subs[spec] == nil {
+		h.subs[spec] = map[chan []byte]struct{}{}
+	}
+	h.subs[spec][ch] = struct{}{}
+	h.mu.Unlock()
+	return ch, func() {
+		h.mu.Lock()
+		if _, ok := h.subs[spec][ch]; ok {
+			delete(h.subs[spec], ch)
+			close(ch)
+			if len(h.subs[spec]) == 0 {
+				delete(h.subs, spec)
+			}
+		}
+		h.mu.Unlock()
+	}
+}
+
+func (h *pageEventHub) publish(spec string, b []byte) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	for ch := range h.subs[spec] {
+		select {
+		case ch <- b:
+		default: // the window is behind; its page misses this one
+		}
+	}
+}
+
+var pageEventsOnce sync.Once
+
+// startPageEvents has the host's page events reach the window. Once, since
+// a process has one hub.
+func startPageEvents() {
+	pageEventsOnce.Do(func() {
+		plugin.OnPageEvent(func(e plugin.PageEvent) {
+			b, err := json.Marshal(pageEventJSON{Kind: e.Kind, Name: e.Name, CallID: e.CallID, Method: e.Method,
+				Args: e.Args, Data: e.Data, Result: e.Result, OK: e.OK, Error: e.Error})
+			if err != nil {
+				return
+			}
+			pageEvents.publish(e.Spec, b)
+		})
+	})
+}
+
 // pluginPageRoutes are the routes of the plugins' pages and panels. web is
 // whether the window is a browser's (isWeb): only there is a page's local
 // service served through this server (servePageService), since only there
 // can 127.0.0.1 be another computer than this one.
 func pluginPageRoutes(mux *http.ServeMux, web bool) {
+	startPageEvents()
 	mux.HandleFunc(pluginPagePrefix, func(rw http.ResponseWriter, r *http.Request) { servePluginPage(rw, r, web) })
 	mux.HandleFunc("GET /api/plugin-pages", func(rw http.ResponseWriter, r *http.Request) {
 		out := pluginPages()
@@ -469,15 +702,107 @@ func pluginPageRoutes(mux *http.ServeMux, web bool) {
 		}
 		writeJSON(rw, v)
 	})
+	// the page's stream: events its plugin emits, and calls the plugin
+	// makes into the page. Only the window's own EventSource gets it; the
+	// page's frame has no way to /api at all.
+	mux.HandleFunc("GET /api/plugin-pages/events", func(rw http.ResponseWriter, r *http.Request) {
+		spec := r.URL.Query().Get("spec")
+		pages, _ := windowParts()
+		found := false
+		for i := range pages {
+			if pages[i].Spec == spec {
+				found = true
+				break
+			}
+		}
+		if !found {
+			http.NotFound(rw, r)
+			return
+		}
+		flusher, ok := rw.(http.Flusher)
+		if !ok {
+			fail(rw, errors.New("the server can't stream"))
+			return
+		}
+		ch, cancel := pageEvents.subscribe(spec)
+		defer cancel()
+		rw.Header().Set("Content-Type", "text/event-stream")
+		rw.Header().Set("Cache-Control", "no-store")
+		rw.Header().Set("X-Accel-Buffering", "no")
+		rw.WriteHeader(http.StatusOK)
+		flusher.Flush()
+		ping := time.NewTicker(15 * time.Second)
+		defer ping.Stop()
+		for {
+			select {
+			case <-r.Context().Done():
+				return
+			case b, ok := <-ch:
+				if !ok {
+					return
+				}
+				if _, err := fmt.Fprintf(rw, "data: %s\n\n", b); err != nil {
+					return
+				}
+				flusher.Flush()
+			case <-ping.C:
+				if _, err := fmt.Fprint(rw, ": keepalive\n\n"); err != nil {
+					return
+				}
+				flusher.Flush()
+			}
+		}
+	})
+	// the window asks for a one-time grant before a method its page's
+	// package put in magpie.page.confirm: the page can't ask for one, and
+	// the grant is bound to the page, the method and these arguments
+	mux.HandleFunc("POST /api/plugin-pages/confirm", func(rw http.ResponseWriter, r *http.Request) {
+		var in struct {
+			Spec   string          `json:"spec"`
+			Method string          `json:"method"`
+			Args   json.RawMessage `json:"args"`
+		}
+		if err := json.NewDecoder(http.MaxBytesReader(rw, r.Body, 64<<10)).Decode(&in); err != nil {
+			fail(rw, err)
+			return
+		}
+		method := strings.TrimSpace(in.Method)
+		pages, _ := windowParts()
+		var page *pluginPage
+		for i := range pages {
+			if pages[i].Spec == in.Spec {
+				page = &pages[i]
+				break
+			}
+		}
+		if page == nil {
+			http.NotFound(rw, r)
+			return
+		}
+		if method == "" || !slices.Contains(page.Confirm, method) {
+			rw.Header().Set("Content-Type", "application/json")
+			rw.WriteHeader(http.StatusForbidden)
+			_ = json.NewEncoder(rw).Encode(map[string]string{"error": fmt.Sprintf("%s's page doesn't ask before %q", page.Name, method)})
+			return
+		}
+		id, ok := issuePageConfirm(in.Spec, method, in.Args)
+		if !ok {
+			fail(rw, errors.New("too many confirmations are waiting"))
+			return
+		}
+		writeJSON(rw, map[string]string{"confirmId": id})
+	})
 	// a page's own methods (magpie.page.actions): only the page's methods
 	// reach its plugin, and the plugin's hooks declare what each one does.
 	// The window has bound the request to the frame's spec before this, and
 	// the host binds it again to the same plugin's hooks.
 	mux.HandleFunc("POST /api/plugin-pages/invoke", func(rw http.ResponseWriter, r *http.Request) {
 		var in struct {
-			Spec   string          `json:"spec"`
-			Method string          `json:"method"`
-			Args   json.RawMessage `json:"args"`
+			Spec       string          `json:"spec"`
+			Method     string          `json:"method"`
+			Args       json.RawMessage `json:"args"`
+			ConfirmID  string          `json:"confirmId"`
+			Background bool            `json:"background"`
 		}
 		if err := json.NewDecoder(http.MaxBytesReader(rw, r.Body, 64<<10)).Decode(&in); err != nil {
 			fail(rw, err)
@@ -506,6 +831,21 @@ func pluginPageRoutes(mux *http.ServeMux, web bool) {
 			_ = json.NewEncoder(rw).Encode(map[string]string{"error": fmt.Sprintf("%s's page doesn't declare %q", page.Name, method)})
 			return
 		}
+		if slices.Contains(page.Confirm, method) && !takePageConfirm(in.ConfirmID, in.Spec, method, in.Args) {
+			rw.Header().Set("Content-Type", "application/json")
+			rw.WriteHeader(http.StatusForbidden)
+			_ = json.NewEncoder(rw).Encode(map[string]string{"error": fmt.Sprintf("%s needs a one-time confirmation for %q", page.Name, method)})
+			return
+		}
+		if in.Background {
+			id, ok := startPageJob(in.Spec, method, in.Args)
+			if !ok {
+				fail(rw, errors.New("too many jobs are waiting"))
+				return
+			}
+			writeJSON(rw, map[string]string{"jobId": id})
+			return
+		}
 		ctx, cancel := context.WithTimeout(r.Context(), 60*time.Second)
 		defer cancel()
 		var out json.RawMessage
@@ -518,6 +858,58 @@ func pluginPageRoutes(mux *http.ServeMux, web bool) {
 		}
 		rw.Header().Set("Content-Type", "application/json")
 		_, _ = rw.Write(out)
+	})
+	// the page's answer to one of its plugin's calls: the window sends it
+	// back to the host waiting on that call, by the page's own spec
+	mux.HandleFunc("POST /api/plugin-pages/reply", func(rw http.ResponseWriter, r *http.Request) {
+		var in struct {
+			Spec   string          `json:"spec"`
+			CallID string          `json:"callId"`
+			OK     bool            `json:"ok"`
+			Result json.RawMessage `json:"result"`
+			Error  string          `json:"error"`
+		}
+		if err := json.NewDecoder(http.MaxBytesReader(rw, r.Body, 64<<10)).Decode(&in); err != nil {
+			fail(rw, err)
+			return
+		}
+		pages, _ := windowParts()
+		found := false
+		for i := range pages {
+			if pages[i].Spec == in.Spec {
+				found = true
+				break
+			}
+		}
+		if !found || in.CallID == "" {
+			http.NotFound(rw, r)
+			return
+		}
+		ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
+		defer cancel()
+		var out json.RawMessage
+		if err := callPageInvoke(ctx, "pageReply", map[string]any{"spec": in.Spec, "id": in.CallID, "ok": in.OK, "pageReply": in.Result, "message": in.Error}, &out); err != nil {
+			fail(rw, err)
+			return
+		}
+		writeJSON(rw, map[string]bool{"ok": true})
+	})
+	// a background call's state, and its cancellation: only this process
+	// has the job, so a magpie restart answers "no such job"
+	mux.HandleFunc("GET /api/plugin-pages/jobs/{id}", func(rw http.ResponseWriter, r *http.Request) {
+		out, ok := pageJobState(r.PathValue("id"))
+		if !ok {
+			http.NotFound(rw, r)
+			return
+		}
+		writeJSON(rw, out)
+	})
+	mux.HandleFunc("POST /api/plugin-pages/jobs/{id}/cancel", func(rw http.ResponseWriter, r *http.Request) {
+		if !cancelPageJob(r.PathValue("id")) {
+			http.NotFound(rw, r)
+			return
+		}
+		writeJSON(rw, map[string]bool{"ok": true})
 	})
 	// a page's or a panel's own options, as plugins.json keeps them: no
 	// other plugin's

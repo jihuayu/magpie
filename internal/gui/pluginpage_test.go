@@ -420,3 +420,130 @@ func TestPluginPageInvokeOnlyDeclared(t *testing.T) {
 		t.Errorf("an unknown page: %d", w.Code)
 	}
 }
+
+// A method the page's package put in magpie.page.confirm takes a one-time
+// confirmation the window got for that page, that method and those
+// arguments: without it the call is refused, it can't be used twice, and
+// the page's answer to a call from its plugin goes back by its spec.
+func TestPluginPageConfirmAndReply(t *testing.T) {
+	on, _ := pagePlugins(t)
+	pkg := `{"name":"magpie-usage-glance","main":"index.js","magpie":{"page":{"title":"Usage glance","file":"page/index.html","actions":["status","run"],"confirm":["run"]}}}`
+	if err := os.WriteFile(filepath.Join(on, "package.json"), []byte(pkg), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	var pages []pluginPage
+	w := do(pageMux(), httptest.NewRequest("GET", "/api/plugin-pages", nil))
+	if err := json.Unmarshal(w.Body.Bytes(), &pages); err != nil || len(pages) != 1 {
+		t.Fatalf("pages: %s %v", w.Body, err)
+	}
+	if len(pages[0].Confirm) != 1 || pages[0].Confirm[0] != "run" {
+		t.Fatalf("confirm %v", pages[0].Confirm)
+	}
+	old := callPageInvoke
+	t.Cleanup(func() { callPageInvoke = old })
+	var calls []map[string]any
+	callPageInvoke = func(ctx context.Context, method string, params, out any) error {
+		if p, ok := params.(map[string]any); ok {
+			calls = append(calls, map[string]any{"method": method, "params": p})
+		}
+		if method == "pageInvoke" {
+			*(out.(*json.RawMessage)) = json.RawMessage(`{"started":true}`)
+		} else {
+			*(out.(*json.RawMessage)) = json.RawMessage(`null`)
+		}
+		return nil
+	}
+	args := `{"legs":["travel"]}`
+	post := func(route, body string) *httptest.ResponseRecorder {
+		r := httptest.NewRequest("POST", route, strings.NewReader(body))
+		r.Header.Set("Content-Type", "application/json")
+		return do(pageMux(), r)
+	}
+	if w := post("/api/plugin-pages/confirm", `{"spec":"`+on+`","method":"status","args":`+args+`}`); w.Code != http.StatusForbidden {
+		t.Errorf("a method not confirmed: %d", w.Code)
+	}
+	w = post("/api/plugin-pages/confirm", `{"spec":"`+on+`","method":"run","args":`+args+`}`)
+	if w.Code != http.StatusOK {
+		t.Fatalf("confirm: %d %s", w.Code, w.Body)
+	}
+	var c struct {
+		ConfirmID string `json:"confirmId"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &c); err != nil || c.ConfirmID == "" {
+		t.Fatalf("confirm id: %s %v", w.Body, err)
+	}
+	if w := post("/api/plugin-pages/invoke", `{"spec":"`+on+`","method":"run","args":`+args+`}`); w.Code != http.StatusForbidden {
+		t.Errorf("run without a confirmation: %d", w.Code)
+	}
+	if w := post("/api/plugin-pages/invoke", `{"spec":"`+on+`","method":"run","args":`+args+`,"confirmId":"`+c.ConfirmID+`"}`); w.Code != http.StatusOK {
+		t.Errorf("run with a confirmation: %d %s", w.Code, w.Body)
+	}
+	if w := post("/api/plugin-pages/invoke", `{"spec":"`+on+`","method":"run","args":`+args+`,"confirmId":"`+c.ConfirmID+`"}`); w.Code != http.StatusForbidden {
+		t.Errorf("the confirmation used twice: %d", w.Code)
+	}
+	if w := post("/api/plugin-pages/reply", `{"spec":"`+on+`","callId":"p1","ok":true,"result":{"done":true}}`); w.Code != http.StatusOK {
+		t.Errorf("reply: %d %s", w.Code, w.Body)
+	}
+	last := calls[len(calls)-1]
+	if last["method"] != "pageReply" {
+		t.Errorf("reply reached %v", last)
+	}
+}
+
+// A long page method runs as a job: the window gets an id at once, asks
+// for its state, and may cancel it; the job's answer is kept for it.
+func TestPluginPageBackgroundJob(t *testing.T) {
+	on, _ := pagePlugins(t)
+	pkg := `{"name":"magpie-usage-glance","main":"index.js","magpie":{"page":{"title":"Usage glance","file":"page/index.html","actions":["slow"]}}}`
+	if err := os.WriteFile(filepath.Join(on, "package.json"), []byte(pkg), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	old := callPageInvoke
+	t.Cleanup(func() { callPageInvoke = old })
+	release := make(chan struct{})
+	started := make(chan struct{}, 1)
+	callPageInvoke = func(ctx context.Context, method string, params, out any) error {
+		if method != "pageInvoke" {
+			return nil
+		}
+		started <- struct{}{}
+		select {
+		case <-release:
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+		*(out.(*json.RawMessage)) = json.RawMessage(`{"ok":true}`)
+		return nil
+	}
+	post := func(body string) *httptest.ResponseRecorder {
+		r := httptest.NewRequest("POST", "/api/plugin-pages/invoke", strings.NewReader(body))
+		r.Header.Set("Content-Type", "application/json")
+		return do(pageMux(), r)
+	}
+	get := func(id string) *httptest.ResponseRecorder {
+		return do(pageMux(), httptest.NewRequest("GET", "/api/plugin-pages/jobs/"+id, nil))
+	}
+	w := post(`{"spec":"` + on + `","method":"slow","background":true}`)
+	if w.Code != http.StatusOK {
+		t.Fatalf("background: %d %s", w.Code, w.Body)
+	}
+	var j struct {
+		JobID string `json:"jobId"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &j); err != nil || j.JobID == "" {
+		t.Fatalf("job id: %s %v", w.Body, err)
+	}
+	<-started
+	if w := get(j.JobID); w.Code != http.StatusOK || !strings.Contains(w.Body.String(), `"state":"running"`) {
+		t.Errorf("running: %d %s", w.Code, w.Body)
+	}
+	close(release)
+	for i := 0; i < 100; i++ {
+		w = get(j.JobID)
+		if strings.Contains(w.Body.String(), `"state":"done"`) && strings.Contains(w.Body.String(), `"ok":true`) {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("the job never finished: %s", w.Body)
+}
