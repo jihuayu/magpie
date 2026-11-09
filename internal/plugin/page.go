@@ -51,6 +51,11 @@ type PageSpec struct {
 	// false, never a package that doesn't parse): a page that works when
 	// no one looks at it. Others are let go after a while hidden.
 	KeepAlive bool
+	// Actions are the methods the page may call of its plugin
+	// (magpie.page.actions): the names magpie.invoke takes, and only from
+	// this page. The plugin's hooks declare each one; a name here that no
+	// hook declares is refused.
+	Actions []string
 }
 
 // ServiceSpec is a page's local service: an HTTP server on 127.0.0.1 at
@@ -92,6 +97,47 @@ var actionID = regexp.MustCompile(`^[a-z0-9][a-z0-9-]{0,39}$`)
 
 // maxActions is how many actions one plugin adds, at most.
 const maxActions = 8
+
+// pageAction is what one of a page's methods (magpie.page.actions) is:
+// short, lower case, digits, dots, dashes and underscores, so a page and
+// its plugin can switch on it
+var pageAction = regexp.MustCompile(`^[a-z][a-z0-9]*(?:[._-][a-z0-9]+)*$`)
+
+// maxPageActions is how many methods one page may call, at most.
+const maxPageActions = 64
+
+// pageActions are a page's methods from magpie.page.actions: a list of
+// names, or an object whose keys are names. What isn't a name is left
+// out, and a name given twice is the first's.
+func pageActions(raw json.RawMessage) []string {
+	if len(raw) == 0 {
+		return nil
+	}
+	var list []string
+	if json.Unmarshal(raw, &list) != nil {
+		var obj map[string]any
+		if json.Unmarshal(raw, &obj) != nil {
+			return nil
+		}
+		list = make([]string, 0, len(obj))
+		for k := range obj {
+			list = append(list, k)
+		}
+		slices.Sort(list)
+	}
+	var out []string
+	for _, name := range list {
+		name = strings.TrimSpace(name)
+		if name == "" || len(name) > 64 || !pageAction.MatchString(name) || slices.Contains(out, name) {
+			continue
+		}
+		if len(out) == maxPageActions {
+			break
+		}
+		out = append(out, name)
+	}
+	return out
+}
 
 // PageReads are the reads a plugin's page can be granted, each in
 // magpie.permissions. None of them carries a secret.
@@ -162,6 +208,7 @@ func Window(target string) (w *WindowSpec, only bool) {
 		Menu      string          `json:"menu"`
 		Service   json.RawMessage `json:"service"`
 		KeepAlive json.RawMessage `json:"keepAlive"`
+		Actions   json.RawMessage `json:"actions"`
 	}
 	var pkg struct {
 		Main    string          `json:"main"`
@@ -179,7 +226,7 @@ func Window(target string) (w *WindowSpec, only bool) {
 	w = &WindowSpec{}
 	if pg := pkg.Magpie.Page; pg != nil {
 		if file, ok := htmlInside(target, pg.File); ok {
-			p := &PageSpec{Title: strings.TrimSpace(pg.Title), Titles: titles(pg.Titles), File: file, Dir: filepath.Dir(file), KeepAlive: string(pg.KeepAlive) == "true"}
+			p := &PageSpec{Title: strings.TrimSpace(pg.Title), Titles: titles(pg.Titles), File: file, Dir: filepath.Dir(file), KeepAlive: string(pg.KeepAlive) == "true", Actions: pageActions(pg.Actions)}
 			// the icon is served with the page, so it sits in the page's folder
 			if icon, ok := inside(target, pg.Icon); ok {
 				if rel, err := filepath.Rel(p.Dir, icon); err == nil && rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
@@ -194,6 +241,10 @@ func Window(target string) (w *WindowSpec, only bool) {
 			// a way to some other program's port on this computer
 			if pkg.Main != "" || len(pkg.Exports) > 0 {
 				p.Service = service(pg.Service)
+			} else {
+				// a page with no host part has nothing to answer its
+				// methods, so they are not offered
+				p.Actions = nil
 			}
 			w.Page = p
 		}

@@ -138,6 +138,13 @@
         if (!o || typeof o !== "object" || Array.isArray(o)) throw new Error(t("A page's options are an object"));
         return api("plugin-pages/options", { spec: e.spec, options: o });
       }
+      case "invoke": {
+        const method = String(m.params?.method || "");
+        // what its package didn't declare is refused here, and again by
+        // the server, and the host keeps the methods of its own plugin
+        if (!Array.isArray(e.methods) || !e.methods.includes(method)) throw new Error(t("No such call: {what}", { what: method }));
+        return api("plugin-pages/invoke", { spec: e.spec, method, args: m.params?.args || {} });
+      }
       case "read": {
         const name = String(m.params?.name || "");
         // what its package didn't declare is refused here, and again by

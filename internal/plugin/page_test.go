@@ -4,6 +4,7 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"strconv"
 	"testing"
 )
 
@@ -239,5 +240,54 @@ func TestWindowActions(t *testing.T) {
 	}
 	if w, _ := Window(mk("many", many+`]}`)); w == nil || len(w.Actions) != maxActions {
 		t.Errorf("12 actions: %+v, want %d", w, maxActions)
+	}
+}
+
+// A page's methods (magpie.page.actions) are the names its page may call
+// of its own plugin: a list or an object's keys, each a short lower-case
+// name, a duplicate once, and none from a page-only plugin, which has no
+// host part to answer one.
+func TestWindowPageActions(t *testing.T) {
+	root := t.TempDir()
+	mk := func(name, pkg string) string {
+		t.Helper()
+		d := filepath.Join(root, name)
+		if err := os.MkdirAll(filepath.Join(d, "page"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(d, "page", "index.html"), []byte("<p>hi</p>"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(d, "package.json"), []byte(pkg), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		return d
+	}
+	main := `{"name":"p","main":"index.js","magpie":{"page":{"file":"page/index.html","actions"`
+	if w, _ := Window(mk("list", main+`:["status","tasks.run","status","Bad Name","-x","a/b"]}}}`)); w == nil || !slices.Equal(w.Page.Actions, []string{"status", "tasks.run"}) {
+		t.Errorf("a list: %+v", w)
+	}
+	if w, _ := Window(mk("object", main+`:{"run":true,"status":true,"run-now":true}}}}`)); w == nil || !slices.Equal(w.Page.Actions, []string{"run", "run-now", "status"}) {
+		t.Errorf("an object: %+v", w)
+	}
+	if w, _ := Window(mk("none", `{"name":"p","main":"index.js","magpie":{"page":{"file":"page/index.html"}}}`)); w == nil || len(w.Page.Actions) != 0 {
+		t.Errorf("no actions: %+v", w)
+	}
+	// a plugin that is only a page has no host to answer its methods
+	if w, _ := Window(mk("only", `{"name":"p","magpie":{"page":{"file":"page/index.html","actions":["status"]}}}`)); w == nil || len(w.Page.Actions) != 0 {
+		t.Errorf("a page-only plugin's actions: %+v", w)
+	}
+	many := `["`
+	names := make([]string, 0, maxPageActions+2)
+	for i := range maxPageActions + 2 {
+		name := "m" + strconv.Itoa(i)
+		names = append(names, name)
+		if i > 0 {
+			many += `","`
+		}
+		many += name
+	}
+	if w, _ := Window(mk("many", main+`:`+many+`"]}}}`)); w == nil || len(w.Page.Actions) != maxPageActions {
+		t.Errorf("%d actions: %+v, want %d", len(names), w, maxPageActions)
 	}
 }

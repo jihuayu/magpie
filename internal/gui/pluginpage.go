@@ -79,6 +79,9 @@ type pluginPage struct {
 	// plugin's in plugins.json's order to ask for it
 	Replaces string   `json:"replaces,omitempty"`
 	Reads    []string `json:"reads"` // what it may read, of plugin.PageReads
+	// Methods are the methods the page may call of its plugin
+	// (magpie.page.actions): only these reach /api/plugin-pages/invoke
+	Methods []string `json:"methods,omitempty"`
 	// Actions are its items in magpie's menus (plugin.ActionSpec); each
 	// opens this page
 	Actions []pluginAction `json:"actions,omitempty"`
@@ -158,7 +161,7 @@ func windowParts() (pages []pluginPage, panels []pluginPanel) {
 		if spec := w.Page; spec != nil {
 			tok := pageToken(e.Spec)
 			rel, _ := filepath.Rel(spec.Dir, spec.File)
-			p := pluginPage{Spec: e.Spec, Name: name, Key: key, Title: spec.Title, Titles: spec.Titles, Reads: reads, token: tok, dir: spec.Dir,
+			p := pluginPage{Spec: e.Spec, Name: name, Key: key, Title: spec.Title, Titles: spec.Titles, Reads: reads, Methods: spec.Actions, token: tok, dir: spec.Dir,
 				URL: pluginPagePrefix + tok + "/" + filepath.ToSlash(rel), file: filepath.ToSlash(rel), hosted: !only, options: e.Options, KeepAlive: spec.KeepAlive}
 			if !only {
 				p.service = spec.Service
@@ -407,6 +410,10 @@ func apiFramed(r *http.Request) bool {
 	return r.Header.Get("Sec-Fetch-Site") == "cross-site" && r.Header.Get("Sec-Fetch-Dest") != "document"
 }
 
+// callPageInvoke runs one of a page's methods in its plugin. It is
+// plugin.Call, replaced in tests that run no host.
+var callPageInvoke = plugin.Call
+
 // pluginPageRoutes are the routes of the plugins' pages and panels. web is
 // whether the window is a browser's (isWeb): only there is a page's local
 // service served through this server (servePageService), since only there
@@ -461,6 +468,56 @@ func pluginPageRoutes(mux *http.ServeMux, web bool) {
 			return
 		}
 		writeJSON(rw, v)
+	})
+	// a page's own methods (magpie.page.actions): only the page's methods
+	// reach its plugin, and the plugin's hooks declare what each one does.
+	// The window has bound the request to the frame's spec before this, and
+	// the host binds it again to the same plugin's hooks.
+	mux.HandleFunc("POST /api/plugin-pages/invoke", func(rw http.ResponseWriter, r *http.Request) {
+		var in struct {
+			Spec   string          `json:"spec"`
+			Method string          `json:"method"`
+			Args   json.RawMessage `json:"args"`
+		}
+		if err := json.NewDecoder(http.MaxBytesReader(rw, r.Body, 64<<10)).Decode(&in); err != nil {
+			fail(rw, err)
+			return
+		}
+		method := strings.TrimSpace(in.Method)
+		if in.Spec == "" || method == "" {
+			fail(rw, errors.New("a page and a method are needed"))
+			return
+		}
+		pages, _ := windowParts()
+		var page *pluginPage
+		for i := range pages {
+			if pages[i].Spec == in.Spec {
+				page = &pages[i]
+				break
+			}
+		}
+		if page == nil {
+			http.NotFound(rw, r)
+			return
+		}
+		if !slices.Contains(page.Methods, method) {
+			rw.Header().Set("Content-Type", "application/json")
+			rw.WriteHeader(http.StatusForbidden)
+			_ = json.NewEncoder(rw).Encode(map[string]string{"error": fmt.Sprintf("%s's page doesn't declare %q", page.Name, method)})
+			return
+		}
+		ctx, cancel := context.WithTimeout(r.Context(), 60*time.Second)
+		defer cancel()
+		var out json.RawMessage
+		if err := callPageInvoke(ctx, "pageInvoke", map[string]any{"spec": in.Spec, "method": method, "args": in.Args}, &out); err != nil {
+			fail(rw, err)
+			return
+		}
+		if len(out) == 0 {
+			out = json.RawMessage("null")
+		}
+		rw.Header().Set("Content-Type", "application/json")
+		_, _ = rw.Write(out)
 	})
 	// a page's or a panel's own options, as plugins.json keeps them: no
 	// other plugin's

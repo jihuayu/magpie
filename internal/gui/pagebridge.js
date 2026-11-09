@@ -10,6 +10,9 @@
 //   await magpie.options.set(o)   sets them, and answers with them
 //   await magpie.read(name, p)    a read its package.json's
 //                                 magpie.permissions declares
+//   await magpie.invoke(m, p)     a method its package.json's
+//                                 magpie.page.actions names, run by its
+//                                 own plugin's hooks ({page: {actions}})
 //   magpie.context                where a panel is (P5): { provider: {
 //                                 id, name } } in a provider's editor,
 //                                 else {}; set once magpie.ready is
@@ -128,6 +131,11 @@
       set: (options) => call("options.set", { options }),
     },
     read: (name, params) => call("read", { name, params }),
+    // invoke calls one of the plugin's methods this page named in its
+    // package.json's magpie.page.actions. Only this page's methods reach
+    // its own plugin: the window binds the call to the frame, and the
+    // host looks the method up among that plugin's hooks alone.
+    invoke: (method, params) => call("invoke", { method: String(method ?? ""), args: params ?? {} }),
   };
   api.ready = call("hello").then(({ context, service, visible, ...theme }) => {
     api.theme = theme;

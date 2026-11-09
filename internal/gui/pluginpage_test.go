@@ -373,3 +373,50 @@ func TestPluginPageActions(t *testing.T) {
 		t.Errorf("an action with no title: %+v, want the page's", a[1])
 	}
 }
+
+// A page's methods (magpie.page.actions) come to the window with the page,
+// and only those it named reach its plugin: one it didn't is refused before
+// the host is asked, and the spec Go passes on is the page's own.
+func TestPluginPageInvokeOnlyDeclared(t *testing.T) {
+	on, _ := pagePlugins(t)
+	pkg := `{"name":"magpie-usage-glance","main":"index.js","magpie":{"page":{"title":"Usage glance","file":"page/index.html","actions":["status","run"]}}}`
+	if err := os.WriteFile(filepath.Join(on, "package.json"), []byte(pkg), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	var pages []pluginPage
+	w := do(pageMux(), httptest.NewRequest("GET", "/api/plugin-pages", nil))
+	if err := json.Unmarshal(w.Body.Bytes(), &pages); err != nil || len(pages) != 1 {
+		t.Fatalf("pages: %s %v", w.Body, err)
+	}
+	if len(pages[0].Methods) != 2 || pages[0].Methods[0] != "status" || pages[0].Methods[1] != "run" {
+		t.Fatalf("methods %v", pages[0].Methods)
+	}
+	old := callPageInvoke
+	t.Cleanup(func() { callPageInvoke = old })
+	var got map[string]any
+	callPageInvoke = func(ctx context.Context, method string, params, out any) error {
+		if method != "pageInvoke" {
+			t.Errorf("host method %q", method)
+		}
+		got, _ = params.(map[string]any)
+		*(out.(*json.RawMessage)) = json.RawMessage(`{"jobId":"job-1"}`)
+		return nil
+	}
+	post := func(body string) *httptest.ResponseRecorder {
+		r := httptest.NewRequest("POST", "/api/plugin-pages/invoke", strings.NewReader(body))
+		r.Header.Set("Content-Type", "application/json")
+		return do(pageMux(), r)
+	}
+	if w := post(`{"spec":"` + on + `","method":"stop"}`); w.Code != http.StatusForbidden {
+		t.Errorf("an undeclared method: %d %s", w.Code, w.Body)
+	}
+	if w := post(`{"spec":"` + on + `","method":"run","args":{"legs":["travel"]}}`); w.Code != http.StatusOK || !strings.Contains(w.Body.String(), `"jobId":"job-1"`) {
+		t.Errorf("a declared method: %d %s", w.Code, w.Body)
+	}
+	if got["spec"] != on || got["method"] != "run" {
+		t.Errorf("passed on %v", got)
+	}
+	if w := post(`{"spec":"` + on + `x","method":"run"}`); w.Code != http.StatusNotFound {
+		t.Errorf("an unknown page: %d", w.Code)
+	}
+}

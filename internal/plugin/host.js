@@ -1880,6 +1880,50 @@ async function runTool({ spec, name, args, ms, agent }) {
   return { text: out === undefined ? "" : JSON.stringify(out) }
 }
 
+// ---- a page's methods -------------------------------------------------------
+//
+// A plugin's page calls the methods its package.json's magpie.page.actions
+// names through magpie.invoke (pagebridge.js): the window asks Go, Go calls
+// pageInvoke here, and this runs the method the plugin's own hooks declared
+// for that page. pageActionsOf looks only at the hooks of the spec Go named,
+// so one plugin's page can't reach another's methods even if it names them.
+
+const PAGE_METHOD = /^[a-z][a-z0-9]*(?:[._-][a-z0-9]+)*$/
+
+function pageActionsOf(spec) {
+  const m = new Map()
+  for (const h of hooks) {
+    if (h.spec !== spec) continue
+    const acts = h.hooks.page?.actions
+    if (!acts || typeof acts !== "object") continue
+    for (const [name, fn] of Object.entries(acts)) {
+      if (PAGE_METHOD.test(name) && typeof fn === "function") m.set(name, fn)
+    }
+  }
+  return m
+}
+
+async function runPageAction({ spec, method, args, ms }) {
+  const name = String(method ?? "")
+  const fn = pageActionsOf(spec).get(name)
+  if (!fn) throw new Error(`${spec} has no page action ${name}`)
+  if (args == null) args = {}
+  if (typeof args !== "object" || Array.isArray(args)) throw new Error(`${name}'s arguments are an object`)
+  const abort = AbortSignal.timeout(ms > 0 ? ms : 60_000)
+  const ctx = {
+    spec,
+    directory,
+    worktree: directory,
+    abort,
+    metadata() {},
+  }
+  const out = await Promise.race([
+    Promise.resolve().then(() => fn(args, ctx)),
+    new Promise((_, reject) => abort.addEventListener("abort", () => reject(new Error(`${name} took longer than ${took(ms || 60_000)}`)), { once: true })),
+  ])
+  return out === undefined ? null : out
+}
+
 // ---- web search APIs --------------------------------------------------------
 //
 // A plugin's search hook adds web search APIs to magpie's own list (Tavily,
@@ -3315,6 +3359,7 @@ const handlers = {
   authorize,
   callback,
   tool: runTool,
+  pageInvoke: runPageAction,
   search: runSearch,
   apiKey,
   load,
